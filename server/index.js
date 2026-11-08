@@ -65,9 +65,15 @@ function createServer(config, manager) {
     catch { return json(res, 400, { error: 'Invalid request target.' }); }
     try {
       if (url.pathname.startsWith('/api/')) {
+        if (req.method === 'POST' && url.pathname === '/api/enroll') {
+          if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) return json(res, 415, { error: 'Send application/json.' });
+          const body = await readJSON(req);
+          return json(res, 201, await manager.enrollDevice(body?.name, body?.publicKey, body?.invitation));
+        }
         if (!authenticated(req, config.token)) return unauthorized(res);
         if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await manager.getStatus());
         if (req.method === 'GET' && url.pathname === '/api/peers') return json(res, 200, { peers: await manager.listPeers() });
+        if (req.method === 'POST' && url.pathname === '/api/invitations') return json(res, 201, await manager.createInvitation());
         if (req.method === 'POST' && url.pathname === '/api/peers') {
           if (!/^application\/json(?:\s*;|$)/i.test(req.headers['content-type'] || '')) return json(res, 415, { error: 'Send application/json.' });
           const body = await readJSON(req);
@@ -119,10 +125,10 @@ async function main() {
     throw new Error('The live WireGuard interface does not match its on-disk config. Reconcile the interface and config before starting the manager.');
   }
   const manager = new Manager(config, ifaceConfig);
-  await manager.reconcileRevocations();
+  await manager.reconcile();
   const server = createServer(config, manager);
   const recoveryTimer = setInterval(() => {
-    manager.reconcileRevocations().catch((error) => console.error(`[recovery] Pending peer revocation could not be completed: ${error.message}`));
+    manager.reconcile().catch((error) => console.error(`[recovery] Pending peer operation could not be completed: ${error.message}`));
   }, 15_000);
   recoveryTimer.unref();
   server.listen(config.port, config.bind, () => {

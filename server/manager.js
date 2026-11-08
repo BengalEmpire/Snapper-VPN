@@ -16,11 +16,29 @@ function loadState(statePath) {
     const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
     if (parsed.version !== 1 || !parsed.peers || typeof parsed.peers !== 'object' || Array.isArray(parsed.peers)) throw new Error('unsupported state format');
     if (parsed.revocations !== undefined && (!Array.isArray(parsed.revocations) || parsed.revocations.some((key) => typeof key !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(key)))) throw new Error('invalid revocation journal');
-    return { ...parsed, revocations: parsed.revocations || [] };
+    if (parsed.invitations !== undefined && (!parsed.invitations || typeof parsed.invitations !== 'object' || Array.isArray(parsed.invitations))) throw new Error('invalid invitations');
+    for (const [hash, invitation] of Object.entries(parsed.invitations || {})) {
+      if (!/^[a-f0-9]{64}$/.test(hash) || !Number.isSafeInteger(invitation.expiresAt) || (invitation.consumedByPublicKey && !/^[A-Za-z0-9+/]{43}=$/.test(invitation.consumedByPublicKey))) throw new Error('invalid invitation record');
+    }
+    return { ...parsed, revocations: parsed.revocations || [], invitations: parsed.invitations || {} };
   } catch (error) {
-    if (error.code === 'ENOENT') return { version: 1, peers: {}, revocations: [] };
+    if (error.code === 'ENOENT') return { version: 1, peers: {}, revocations: [], invitations: {} };
     throw new Error(`Cannot load peer state ${statePath}: ${error.message}`);
   }
+}
+
+function operationError(message, statusCode) {
+  return Object.assign(new Error(message), { statusCode });
+}
+
+function validWireGuardKey(value) {
+  if (typeof value !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(value)) return false;
+  const bytes = Buffer.from(value, 'base64');
+  return bytes.length === 32 && bytes.some((byte) => byte !== 0) && bytes.toString('base64') === value;
+}
+
+function validDeviceName(value) {
+  return typeof value === 'string' && value.trim().length >= 1 && value.trim().length <= 64 && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 class Manager {
@@ -79,6 +97,111 @@ class Manager {
       configuredPeers: live.peers.length,
       clientSubnet: this.config.subnetText
     };
+  }
+
+  createInvitation() {
+    return this.serialize(async () => {
+      const state = this.readState();
+      const now = Date.now();
+      const invitations = Object.fromEntries(Object.entries(state.invitations).filter(([, entry]) => entry.expiresAt > now));
+      const pending = Object.values(invitations).filter((entry) => !entry.consumedByPublicKey).length;
+      if (pending >= 100) throw operationError('There are already 100 active invitations. Wait for some to expire or use them first.', 429);
+      const token = crypto.randomBytes(32).toString('base64url');
+      const expiresAt = now + 10 * 60 * 1000;
+      const hash = crypto.createHash('sha256').update(token).digest('hex');
+      invitations[hash] = { createdAt: now, expiresAt };
+      atomicWrite(this.config.statePath, `${JSON.stringify({ ...state, invitations }, null, 2)}\n`, 0o600);
+      return { invitation: token, expiresAt: new Date(expiresAt).toISOString() };
+    });
+  }
+
+  async ensureManagedPeer(publicKey, address, liveByKey = null) {
+    let configText = this.readConfig();
+    const configuredPeer = parsePeers(configText).find((peer) => peer.fields.publickey === publicKey);
+    if (configuredPeer) {
+      const configuredIPs = configuredPeer.fields.allowedips.split(',').map((value) => value.trim());
+      if (configuredIPs.length !== 1 || configuredIPs[0] !== `${address}/32`) throw new Error('Managed peer address does not match its persistent WireGuard config.');
+    } else {
+      configText = appendPeer(configText, publicKey, address);
+      atomicWrite(this.config.configPath, configText, 0o600);
+    }
+    if (!liveByKey) {
+      const live = await status(this.config.iface);
+      liveByKey = new Map(live.peers.map((peer) => [peer.publicKey, peer]));
+    }
+    const current = liveByKey.get(publicKey);
+    if (!current || current.allowedIPs !== `${address}/32`) {
+      await setPeer(this.config.iface, publicKey, `${address}/32`);
+      liveByKey.set(publicKey, { publicKey, allowedIPs: `${address}/32` });
+    }
+  }
+
+  enrollDevice(name, publicKey, token) {
+    return this.serialize(async () => {
+      if (!validDeviceName(name)) throw operationError('Device name must be 1-64 printable characters.', 400);
+      if (!validWireGuardKey(publicKey)) throw operationError('A valid WireGuard public key is required.', 400);
+      if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) throw operationError('Invalid or expired invitation.', 401);
+
+      const state = this.readState();
+      const hash = crypto.createHash('sha256').update(token).digest('hex');
+      const invitation = state.invitations[hash];
+      if (!invitation) throw operationError('Invalid or expired invitation.', 401);
+      if (invitation.expiresAt <= Date.now()) throw operationError('This invitation has expired.', 410);
+      if (invitation.consumedByPublicKey) {
+        if (invitation.consumedByPublicKey !== publicKey) throw operationError('This invitation has already been used.', 409);
+        const saved = state.peers[publicKey];
+        if (!saved) throw operationError('This invitation belongs to a device that has been revoked.', 410);
+        await this.ensureManagedPeer(publicKey, saved.address);
+        return this.enrollmentDetails(saved, await serverPublicKey(this.ifaceConfig.serverKey));
+      }
+      if (state.peers[publicKey]) throw operationError('This public key is already enrolled.', 409);
+
+      const configText = this.readConfig();
+      const live = await status(this.config.iface);
+      if (parsePeers(configText).some((peer) => peer.fields.publickey === publicKey) || live.peers.some((peer) => peer.publicKey === publicKey)) {
+        throw operationError('This public key is already configured on the gateway.', 409);
+      }
+      const address = this.allocateAddress(configText, live.peers);
+      const serverKey = await serverPublicKey(this.ifaceConfig.serverKey);
+      if (publicKey === serverKey) throw operationError('The server key cannot be enrolled as a client device.', 400);
+      const peer = { id: crypto.randomUUID(), name: name.trim(), address, createdAt: new Date().toISOString() };
+      const nextState = {
+        ...state,
+        peers: { ...state.peers, [publicKey]: peer },
+        invitations: { ...state.invitations, [hash]: { ...invitation, consumedByPublicKey: publicKey } }
+      };
+      atomicWrite(this.config.statePath, `${JSON.stringify(nextState, null, 2)}\n`, 0o600);
+      await this.ensureManagedPeer(publicKey, address);
+      return this.enrollmentDetails(peer, serverKey);
+    });
+  }
+
+  enrollmentDetails(peer, serverKey) {
+    return {
+      id: peer.id,
+      name: peer.name,
+      address: `${peer.address}/32`,
+      serverPublicKey: serverKey || undefined,
+      endpoint: this.config.endpoint,
+      allowedIPs: this.config.allowedIPs,
+      dns: this.config.dns
+    };
+  }
+
+  async applyManagedPeers() {
+    const state = this.readState();
+    const live = await status(this.config.iface);
+    const liveByKey = new Map(live.peers.map((peer) => [peer.publicKey, peer]));
+    for (const [publicKey, peer] of Object.entries(state.peers)) {
+      await this.ensureManagedPeer(publicKey, peer.address, liveByKey);
+    }
+  }
+
+  async reconcile() {
+    return this.serialize(async () => {
+      await this.applyRevocations();
+      await this.applyManagedPeers();
+    });
   }
 
   async applyRevocations() {

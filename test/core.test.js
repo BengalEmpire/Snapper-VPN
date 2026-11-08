@@ -9,7 +9,7 @@ const path = require('node:path');
 const { parseCIDR, parseIPv4, readInterfaceConfig, validateAllowedIPs } = require('../server/config');
 const { appendPeer, atomicWrite, getPeerNetwork, parsePeers, removePeer } = require('../server/wireguard');
 const { Manager } = require('../server/manager');
-const { authenticated } = require('../server/index');
+const { authenticated, createServer } = require('../server/index');
 
 const baseConfig = `[Interface]\nAddress = 10.77.0.1/24\nListenPort = 51820\nPrivateKey = ${crypto.randomBytes(32).toString('base64')}\n`;
 const peerKey = crypto.randomBytes(32).toString('base64');
@@ -63,6 +63,33 @@ test('peer allocator skips gateway, existing peers, and overlapping routes', () 
   assert.throws(() => manager.allocateAddress(overlapping), /subnet is full/);
 });
 
+test('rejects invalid enrollment input before touching gateway state', async () => {
+  const manager = new Manager({}, {});
+  await assert.rejects(manager.enrollDevice('Bad\nDevice', 'invalid', 'invalid'), (error) => error.statusCode === 400);
+  await assert.rejects(manager.enrollDevice('Valid device', 'invalid', 'invalid'), (error) => error.statusCode === 400);
+  const zeroKey = Buffer.alloc(32).toString('base64');
+  await assert.rejects(manager.enrollDevice('Valid device', zeroKey, 'A'.repeat(43)), (error) => error.statusCode === 400);
+});
+
+test('creates a one-use enrollment token while storing only its hash', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'snapper-vpn-invite-'));
+  try {
+    const statePath = path.join(directory, 'state', 'peers.json');
+    const manager = new Manager({ statePath }, {});
+    const result = await manager.createInvitation();
+    assert.match(result.invitation, /^[A-Za-z0-9_-]{43}$/);
+    assert.ok(Date.parse(result.expiresAt) > Date.now());
+    const saved = fs.readFileSync(statePath, 'utf8');
+    assert.equal(saved.includes(result.invitation), false);
+    const state = JSON.parse(saved);
+    const hash = crypto.createHash('sha256').update(result.invitation).digest('hex');
+    assert.ok(state.invitations[hash]);
+    assert.equal(fs.statSync(statePath).mode & 0o777, 0o600);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('atomic writes use restrictive permissions and replace complete files', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'snapper-vpn-test-'));
   try {
@@ -71,6 +98,33 @@ test('atomic writes use restrictive permissions and replace complete files', () 
     assert.equal(fs.readFileSync(file, 'utf8'), '{"version":1}\n');
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('HTTP enrollment API protects invitation creation and keeps the admin token off client enrollment', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'snapper-vpn-http-'));
+  const token = crypto.randomBytes(32).toString('hex');
+  const manager = new Manager({ statePath: path.join(directory, 'state', 'peers.json') }, {});
+  const server = createServer({ token }, manager);
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  try {
+    const denied = await fetch(`${base}/api/invitations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    assert.equal(denied.status, 401);
+    const created = await fetch(`${base}/api/invitations`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: '{}'
+    });
+    assert.equal(created.status, 201);
+    const invitation = await created.json();
+    assert.match(invitation.invitation, /^[A-Za-z0-9_-]{43}$/);
+    const rejected = await fetch(`${base}/api/enroll`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Test device', publicKey: 'invalid', invitation: invitation.invitation })
+    });
+    assert.equal(rejected.status, 400);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });

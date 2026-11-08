@@ -9,6 +9,7 @@ const deviceRows = document.getElementById('device-rows');
 const emptyState = document.getElementById('empty-state');
 const dialog = document.getElementById('device-dialog');
 const form = document.getElementById('device-form');
+const inviteDialog = document.getElementById('invite-dialog');
 const deviceName = document.getElementById('device-name');
 const deviceError = document.getElementById('device-error');
 const createButton = document.getElementById('create-device');
@@ -186,6 +187,51 @@ document.getElementById('empty-add').addEventListener('click', openDialog);
 document.getElementById('close-dialog').addEventListener('click', () => dialog.close());
 document.getElementById('cancel-dialog').addEventListener('click', () => dialog.close());
 dialog.addEventListener('click', (event) => { if (event.target === dialog) dialog.close(); });
+
+document.getElementById('invite-app').addEventListener('click', () => {
+  document.getElementById('invite-error').textContent = '';
+  document.getElementById('invite-result').hidden = true;
+  document.getElementById('invite-start').hidden = false;
+  inviteDialog.showModal();
+});
+
+function clearInvitation() {
+  document.getElementById('invite-code').textContent = '';
+  document.getElementById('invite-expiry').textContent = '';
+}
+document.getElementById('close-invite').addEventListener('click', () => inviteDialog.close());
+inviteDialog.addEventListener('click', (event) => { if (event.target === inviteDialog) inviteDialog.close(); });
+inviteDialog.addEventListener('close', clearInvitation);
+
+document.getElementById('create-invite').addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  const error = document.getElementById('invite-error');
+  error.textContent = '';
+  button.disabled = true;
+  button.textContent = 'Generating…';
+  try {
+    const invitation = await api('/api/invitations', { method: 'POST', body: JSON.stringify({}) });
+    document.getElementById('invite-code').textContent = invitation.invitation;
+    document.getElementById('invite-expiry').textContent = `Expires ${new Date(invitation.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`;
+    document.getElementById('invite-start').hidden = true;
+    document.getElementById('invite-result').hidden = false;
+  } catch (apiError) {
+    error.textContent = apiError.message;
+  } finally {
+    button.disabled = false;
+    button.innerHTML = 'Generate invitation <span>→</span>';
+  }
+});
+
+document.getElementById('copy-invite').addEventListener('click', async () => {
+  const invitation = document.getElementById('invite-code').textContent;
+  try {
+    await navigator.clipboard.writeText(invitation);
+    showToast('Invitation copied. Share it only with its intended user.');
+  } catch {
+    showToast('Clipboard access unavailable. Select and copy the invitation manually.', true);
+  }
+});
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();

@@ -10,7 +10,8 @@ This is a single-gateway, IPv4-addressed peer manager. Pick a client subnet that
 - Applies peer changes to the live interface and persists them for the next `wg-quick` start.
 - Revokes a managed peer from both the live interface and on-disk configuration.
 - Shows configured peers, actual WireGuard handshake timestamps, and transferred bytes from the live interface.
-- Generates a client `.conf` once at creation. The private client key is not written to the server's peer database or WireGuard config.
+- Generates a client `.conf` once at web-admin creation. The private client key is not written to the server's peer database or WireGuard config.
+- Issues ten-minute, single-use enrollment invitations and accepts client-generated WireGuard public keys without receiving the client's private key (`POST /api/invitations`, `POST /api/enroll`).
 - Provides a small, token-protected admin dashboard with no sample devices or fabricated connection status.
 - Uses only Node.js built-ins; no JavaScript runtime dependencies are required.
 
@@ -72,6 +73,20 @@ The dashboard manager intentionally listens on `127.0.0.1:3000`. Expose it only 
 
    Open TCP 443 at the firewalls. Visit `https://vpn.example.com`, enter the admin token, and add a device. Import its downloaded `.conf` in the official WireGuard application. The file contains that device's private key; treat it like a password. Each device should get its own peer. If the download is lost, revoke that peer and create a replacement rather than attempting to recover its private key.
 
+## Native-client enrollment API
+
+The Flutter client must not receive `ADMIN_TOKEN`. An administrator creates an invitation over the manager's HTTPS URL; keep the token in an operator-only shell variable and do not paste it into chat or source control:
+
+```sh
+read -rsp 'Snapper admin token: ' SNAPPER_ADMIN_TOKEN; export SNAPPER_ADMIN_TOKEN; echo
+curl --fail-with-body --silent --show-error -X POST 'https://vpn.example.com/api/invitations' \
+  -H "Authorization: Bearer $SNAPPER_ADMIN_TOKEN"
+```
+
+The response contains a random invitation valid for ten minutes. Deliver it to the intended user through a trusted channel. A native client generates its WireGuard keypair locally, stores its private key in OS-protected storage, then sends the invitation, device name, and public key to `POST /api/enroll` over HTTPS. That endpoint returns only the allocated VPN address, server public key, endpoint, DNS, and allowed routes; it never returns or stores the client's private key. Invitations can be retried with the same public key during their validity window, but cannot enroll a different key.
+
+The enrollment API currently has no user accounts or per-device login session. The administrator remains responsible for issuing invitations from the dashboard and revoking enrolled peers from the management dashboard/API. Native mobile/desktop app UI and tunnel adapters are future work.
+
 ## Operations
 
 - `sudo systemctl status wg-quick@wg0` checks the tunnel interface; `sudo wg show wg0` shows live peers and handshakes.
@@ -81,6 +96,10 @@ The dashboard manager intentionally listens on `127.0.0.1:3000`. Expose it only 
 - Peer creation uses atomic config/state writes and live WireGuard updates. Revocation records a durable intent before removing the live peer and config; a small recovery loop completes interrupted revocations. Avoid manually editing managed peer blocks while the service is running. Existing unmanaged peers are displayed as externally managed and cannot be revoked from this UI.
 - To change the interface, endpoint, subnet, DNS, or allowed networks, edit the protected `.env` and matching WireGuard config as appropriate, then restart the manager. Changing the tunnel subnet also requires changing the interface address and existing client configurations. Take a backup first.
 - The setup uses IPv4 iptables rules. It does not configure IPv6 egress, nftables policy, cloud firewall rules, DNS, TLS certificates, or network-provider port forwarding for you.
+
+## Client platform roadmap
+
+The Flutter Android/iOS/Windows clients, browser extension, and Rust WebView shell are not implemented yet. Their platform-specific integration plan, security boundaries, prerequisites, and acceptance gates are documented in [the client and browser roadmap](docs/mobile-desktop-browser-plan.md). The server now supports one-time client-public-key enrollment, but the admin token must never be embedded in a distributed client.
 
 ## Local development and checks
 
