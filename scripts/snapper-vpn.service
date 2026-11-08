@@ -1,0 +1,26 @@
+[Unit]
+Description=Snapper VPN WireGuard peer manager
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/snapper-vpn
+ExecStart=/usr/bin/node /opt/snapper-vpn/server/index.js
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+ReadWritePaths=/etc/wireguard /var/lib/snapper-vpn
+
+[Install]
+WantedBy=multi-user.target

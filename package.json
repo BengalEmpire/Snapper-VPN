@@ -1,20 +1,16 @@
 {
-  "name": "Snapper-VPN",
-  "version": "0.0.1",
-  "description": "A simple Node.js-based VPN app",
+  "name": "snapper-vpn",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A WireGuard VPN gateway peer manager for real Linux servers",
   "main": "server/index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "start-server": "node server/index.js",
-    "start-client": "node client/index.js",
-    "dev": "concurrently \"npm run start-server\" \"npm run start-client\""
+    "start": "node server/index.js",
+    "setup": "node scripts/setup.js",
+    "test": "node --test"
   },
-  "dependencies": {
-    "crypto": "1.0.1",
-    "dotenv": "^10.0.0",
-    "net": "1.0.2",
-    "concurrently": "^7.0.0"
-  },
-  "devDependencies": {},
-  "author": "BengalEmpire",
   "license": "MIT"
 }
